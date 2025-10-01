@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/korotovsky/slack-mcp-server/pkg/handler"
@@ -14,6 +16,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
 type MCPServer struct {
@@ -28,6 +31,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 		server.WithLogging(),
 		server.WithRecovery(),
 		server.WithToolHandlerMiddleware(buildLoggerMiddleware(logger)),
+		server.WithToolHandlerMiddleware(buildRateLimitMiddleware(logger)),
 		server.WithToolHandlerMiddleware(auth.BuildMiddleware(provider.ServerTransport(), logger)),
 	)
 
@@ -221,23 +225,6 @@ func (s *MCPServer) ServeSSE(addr string) *server.SSEServer {
 	)
 }
 
-func (s *MCPServer) ServeHTTP(addr string) *server.StreamableHTTPServer {
-	s.logger.Info("Creating HTTP server",
-		zap.String("context", "console"),
-		zap.String("version", version.Version),
-		zap.String("build_time", version.BuildTime),
-		zap.String("commit_hash", version.CommitHash),
-		zap.String("address", addr),
-	)
-	return server.NewStreamableHTTPServer(s.server,
-		server.WithEndpointPath("/mcp"),
-		server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
-			ctx = auth.AuthFromRequest(s.logger)(ctx, r)
-
-			return ctx
-		}),
-	)
-}
 
 func (s *MCPServer) ServeStdio() error {
 	s.logger.Info("Starting STDIO server",
@@ -272,6 +259,50 @@ func buildLoggerMiddleware(logger *zap.Logger) server.ToolHandlerMiddleware {
 			)
 
 			return res, err
+		}
+	}
+}
+
+func buildRateLimitMiddleware(logger *zap.Logger) server.ToolHandlerMiddleware {
+	rpsValue := 3.0
+	if env := os.Getenv("SLACK_MCP_RATE_LIMIT_RPS"); env != "" {
+		if parsed, err := strconv.ParseFloat(env, 64); err == nil && parsed > 0 {
+			rpsValue = parsed
+		}
+	}
+
+	burst := 6
+	if env := os.Getenv("SLACK_MCP_RATE_LIMIT_BURST"); env != "" {
+		if parsed, err := strconv.Atoi(env); err == nil && parsed > 0 {
+			burst = parsed
+		}
+	}
+
+	limiter := rate.NewLimiter(rate.Limit(rpsValue), burst)
+
+	logger.Info("Rate limiting enabled",
+		zap.Float64("rps", rpsValue),
+		zap.Int("burst", burst),
+	)
+
+	return func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+		return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if !limiter.Allow() {
+				logger.Warn("Rate limit exceeded",
+					zap.String("tool", req.Params.Name),
+				)
+				return &mcp.CallToolResult{
+					Content: []interface{}{
+						map[string]interface{}{
+							"type": "text",
+							"text": "Rate limit exceeded. Please slow down your requests.",
+						},
+					},
+					IsError: true,
+				}, nil
+			}
+
+			return next(ctx, req)
 		}
 	}
 }

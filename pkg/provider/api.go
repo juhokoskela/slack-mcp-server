@@ -22,6 +22,7 @@ const channelsNotReadyMsg = "channels cache is not ready yet, sync process is st
 const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
 var AllChanTypes = []string{"mpim", "im", "public_channel", "private_channel"}
+var PublicChanTypes = []string{"mpim", "im", "public_channel"}
 var PrivateChanType = "private_channel"
 var PubChanType = "public_channel"
 
@@ -493,7 +494,7 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 		}
 	}
 
-	channels := ap.GetChannels(ctx, AllChanTypes)
+	channels := ap.GetChannels(ctx, PublicChanTypes)
 
 	if data, err := json.MarshalIndent(channels, "", "  "); err != nil {
 		ap.logger.Error("Failed to marshal channels for cache", zap.Error(err))
@@ -549,9 +550,30 @@ func (ap *ApiProvider) GetSlackConnect(ctx context.Context) ([]slack.User, error
 	return res, nil
 }
 
-func (ap *ApiProvider) GetChannelsType(ctx context.Context, channelType string) []Channel {
+
+func (ap *ApiProvider) GetChannels(ctx context.Context, channelTypes []string) []Channel {
+	if len(channelTypes) == 0 {
+		channelTypes = AllChanTypes
+	}
+
+	// Only request channel types that don't require additional scopes
+	publicTypes := []string{"public_channel", "im", "mpim"}
+	var requestTypes []string
+	for _, t := range channelTypes {
+		for _, pt := range publicTypes {
+			if t == pt {
+				requestTypes = append(requestTypes, t)
+			}
+		}
+	}
+
+	ap.logger.Info("Requesting channel types",
+		zap.Strings("input_types", channelTypes),
+		zap.Strings("filtered_types", requestTypes),
+	)
+
 	params := &slack.GetConversationsParameters{
-		Types:           []string{channelType},
+		Types:           requestTypes,
 		Limit:           999,
 		ExcludeArchived: true,
 	}
@@ -559,9 +581,8 @@ func (ap *ApiProvider) GetChannelsType(ctx context.Context, channelType string) 
 	var (
 		channels []slack.Channel
 		chans    []Channel
-
-		nextcur string
-		err     error
+		nextcur  string
+		err      error
 	)
 
 	for {
@@ -571,16 +592,36 @@ func (ap *ApiProvider) GetChannelsType(ctx context.Context, channelType string) 
 		}
 
 		channels, nextcur, err = ap.client.GetConversationsContext(ctx, params)
-		ap.logger.Debug("Fetched channels for ",
-			zap.String("channelType", channelType),
-			zap.Int("count", len(channels)),
-		)
 		if err != nil {
-			ap.logger.Error("Failed to fetch channels", zap.Error(err))
-			break
+			// If we get a missing_scope error, try with minimal scopes first
+			if strings.Contains(err.Error(), "missing_scope") {
+				ap.logger.Warn("Missing scope for full channel access, trying with minimal types",
+					zap.Error(err),
+					zap.Strings("requested_types", requestTypes))
+
+				// Try with just public channels
+				minimalParams := &slack.GetConversationsParameters{
+					Types:           []string{"public_channel"},
+					Limit:           999,
+					ExcludeArchived: true,
+				}
+
+				channels, nextcur, err = ap.client.GetConversationsContext(ctx, minimalParams)
+				if err != nil {
+					ap.logger.Error("Failed to fetch even public channels", zap.Error(err))
+					return []Channel{}
+				}
+			} else {
+				ap.logger.Error("Failed to fetch channels", zap.Error(err))
+				break
+			}
 		}
 
-		chans = make([]Channel, 0, len(channels))
+		ap.logger.Debug("Fetched channels",
+			zap.Int("count", len(channels)),
+			zap.Strings("types", requestTypes),
+		)
+
 		for _, channel := range channels {
 			ch := mapChannel(
 				channel.ID,
@@ -597,6 +638,8 @@ func (ap *ApiProvider) GetChannelsType(ctx context.Context, channelType string) 
 				ap.ProvideUsersMap().Users,
 			)
 			chans = append(chans, ch)
+			ap.channels[ch.ID] = ch
+			ap.channelsInv[ch.Name] = ch.ID
 		}
 
 		if nextcur == "" {
@@ -605,32 +648,15 @@ func (ap *ApiProvider) GetChannelsType(ctx context.Context, channelType string) 
 
 		params.Cursor = nextcur
 	}
-	return chans
-}
 
-func (ap *ApiProvider) GetChannels(ctx context.Context, channelTypes []string) []Channel {
-	if len(channelTypes) == 0 {
-		channelTypes = AllChanTypes
-	}
-
-	var chans []Channel
-	for _, t := range AllChanTypes {
-		var typeChannels = ap.GetChannelsType(ctx, t)
-		chans = append(chans, typeChannels...)
-	}
-
-	for _, ch := range chans {
-		ap.channels[ch.ID] = ch
-		ap.channelsInv[ch.Name] = ch.ID
-	}
-
+	// Filter results based on originally requested types
 	var res []Channel
 	for _, t := range channelTypes {
-		for _, channel := range ap.channels {
-			if t == "public_channel" && !channel.IsPrivate {
+		for _, channel := range chans {
+			if t == "public_channel" && !channel.IsPrivate && !channel.IsIM && !channel.IsMpIM {
 				res = append(res, channel)
 			}
-			if t == "private_channel" && channel.IsPrivate {
+			if t == "private_channel" && channel.IsPrivate && !channel.IsIM && !channel.IsMpIM {
 				res = append(res, channel)
 			}
 			if t == "im" && channel.IsIM {

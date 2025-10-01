@@ -2,11 +2,17 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -24,19 +30,13 @@ func withAuthKey(ctx context.Context, auth string) context.Context {
 // Authenticate checks if the request is authenticated based on the provided context.
 func validateToken(ctx context.Context, logger *zap.Logger) (bool, error) {
 	// no configured token means no authentication
-	keyA := os.Getenv("SLACK_MCP_API_KEY")
+	keyA := os.Getenv("SLACK_MCP_SSE_API_KEY")
+	jwtSecret := os.Getenv("SLACK_MCP_JWT_SECRET")
 	if keyA == "" {
-		keyA = os.Getenv("SLACK_MCP_SSE_API_KEY")
-		if keyA != "" {
-			logger.Warn("SLACK_MCP_SSE_API_KEY is deprecated, please use SLACK_MCP_API_KEY")
+		if jwtSecret == "" {
+			logger.Debug("No SSE authentication configured, skipping")
+			return true, nil
 		}
-	}
-
-	if keyA == "" {
-		logger.Debug("No SSE API key configured, skipping authentication",
-			zap.String("context", "http"),
-		)
-		return true, nil
 	}
 
 	keyB, ok := ctx.Value(authKey{}).(string)
@@ -56,17 +56,35 @@ func validateToken(ctx context.Context, logger *zap.Logger) (bool, error) {
 		keyB = strings.TrimPrefix(keyB, "Bearer ")
 	}
 
-	if subtle.ConstantTimeCompare([]byte(keyA), []byte(keyB)) != 1 {
-		logger.Warn("Invalid auth token provided",
+	// Try JWT validation first if secret is configured
+	if jwtSecret != "" {
+		if err := validateJWTToken(keyB, jwtSecret); err == nil {
+			logger.Debug("JWT token validated successfully",
+				zap.String("context", "http"),
+			)
+			return true, nil
+		}
+		logger.Debug("JWT validation failed, trying simple token",
 			zap.String("context", "http"),
 		)
-		return false, fmt.Errorf("invalid auth token")
 	}
 
-	logger.Debug("Auth token validated successfully",
-		zap.String("context", "http"),
-	)
-	return true, nil
+	// Fallback to simple token validation
+	if keyA != "" {
+		if subtle.ConstantTimeCompare([]byte(keyA), []byte(keyB)) != 1 {
+			logger.Warn("Invalid auth token provided",
+				zap.String("context", "http"),
+			)
+			return false, fmt.Errorf("invalid auth token")
+		}
+
+		logger.Debug("Auth token validated successfully",
+			zap.String("context", "http"),
+		)
+		return true, nil
+	}
+
+	return false, fmt.Errorf("no valid authentication method")
 }
 
 // AuthFromRequest extracts the auth token from the request headers.
@@ -114,7 +132,7 @@ func IsAuthenticated(ctx context.Context, transport string, logger *zap.Logger) 
 	case "stdio":
 		return true, nil
 
-	case "sse", "http":
+	case "sse":
 		authenticated, err := validateToken(ctx, logger)
 
 		if err != nil {
@@ -141,4 +159,78 @@ func IsAuthenticated(ctx context.Context, transport string, logger *zap.Logger) 
 		)
 		return false, fmt.Errorf("unknown transport type: %s", transport)
 	}
+}
+
+func validateJWTToken(token, secret string) error {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return fmt.Errorf("invalid token format")
+	}
+
+	// Decode header
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return fmt.Errorf("invalid header encoding")
+	}
+
+	var header struct {
+		Alg string `json:"alg"`
+		Typ string `json:"typ"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return fmt.Errorf("invalid header format")
+	}
+
+	if header.Alg != "HS256" {
+		return fmt.Errorf("unsupported algorithm: %s", header.Alg)
+	}
+
+	// Verify signature
+	message := parts[0] + "." + parts[1]
+	expectedSignature := base64.RawURLEncoding.EncodeToString(hmacSHA256([]byte(message), []byte(secret)))
+	if expectedSignature != parts[2] {
+		return fmt.Errorf("invalid signature")
+	}
+
+	// Decode payload
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return fmt.Errorf("invalid payload encoding")
+	}
+
+	var payload struct {
+		Exp int64  `json:"exp"`
+		Aud string `json:"aud"`
+		Iss string `json:"iss"`
+	}
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		return fmt.Errorf("invalid payload format")
+	}
+
+	// Check expiration
+	if payload.Exp > 0 && time.Now().Unix() > payload.Exp {
+		return fmt.Errorf("token expired")
+	}
+
+	// Check audience if configured
+	if expectedAud := os.Getenv("SLACK_MCP_JWT_AUDIENCE"); expectedAud != "" {
+		if payload.Aud != expectedAud {
+			return fmt.Errorf("invalid audience")
+		}
+	}
+
+	// Check issuer if configured
+	if expectedIss := os.Getenv("SLACK_MCP_JWT_ISSUER"); expectedIss != "" {
+		if payload.Iss != expectedIss {
+			return fmt.Errorf("invalid issuer")
+		}
+	}
+
+	return nil
+}
+
+func hmacSHA256(data, key []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return h.Sum(nil)
 }
