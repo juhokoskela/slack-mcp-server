@@ -33,6 +33,10 @@ func AttachmentToText(att slack.Attachment) string {
 		parts = append(parts, fmt.Sprintf("Text: %s", att.Text))
 	}
 
+	if att.Fallback != "" {
+		parts = append(parts, att.Fallback)
+	}
+
 	if att.Footer != "" {
 		ts, _ := TimestampToIsoRFC3339(string(att.Ts) + ".000000")
 
@@ -44,8 +48,6 @@ func AttachmentToText(att slack.Attachment) string {
 	result = strings.ReplaceAll(result, "\n", " ")
 	result = strings.ReplaceAll(result, "\r", " ")
 	result = strings.ReplaceAll(result, "\t", " ")
-	result = strings.ReplaceAll(result, "(", "[")
-	result = strings.ReplaceAll(result, ")", "]")
 	result = strings.TrimSpace(result)
 
 	return result
