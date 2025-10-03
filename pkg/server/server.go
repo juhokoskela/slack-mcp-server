@@ -291,15 +291,9 @@ func buildRateLimitMiddleware(logger *zap.Logger) server.ToolHandlerMiddleware {
 				logger.Warn("Rate limit exceeded",
 					zap.String("tool", req.Params.Name),
 				)
-				return &mcp.CallToolResult{
-					Content: []interface{}{
-						map[string]interface{}{
-							"type": "text",
-							"text": "Rate limit exceeded. Please slow down your requests.",
-						},
-					},
-					IsError: true,
-				}, nil
+				result := mcp.NewToolResultText("Rate limit exceeded. Please slow down your requests.")
+				result.IsError = true
+				return result, nil
 			}
 
 			return next(ctx, req)
